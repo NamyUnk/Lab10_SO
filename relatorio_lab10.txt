@@ -1,0 +1,1610 @@
+================================================================================
+INF1316 - Sistemas Operacionais
+Lab 10 - Uso de Caches
+Aluna: Fernanda - Matrícula 2310628
+================================================================================
+
+Arquivos entregues:
+  log_gen.c        -> Exercício 1
+  cache_aside.c    -> Exercício 2 (Cache-aside)
+  write_through.c  -> Exercício 3 (Cache write-through)
+  log.txt          -> log gerado pelo log_gen e usado nas execuções
+
+Observações sobre o código fornecido nos slides:
+  O código dos slides (CacheEntry, OpType, gerar_operacoes, get, db_read e
+  db_write) foi usado sem mudanças de lógica, em blocos marcados nos arquivos.
+  Só foram feitos três ajustes para que ele compile:
+   1. No slide "Leitura (lenta) do Banco de Dados" o comentário começa com
+      "/ *" (com espaço). Em C isso não abre comentário e dá erro de
+      compilação, então ficou "/*".
+   2. Os comentários que quebraram de linha no slide ("written/accessed" na
+      struct e "como LRU)" no get) foram juntados na mesma linha, porque em C
+      um comentário com // termina no fim da linha.
+   3. O slide usa DB_SIZE em "int banco_de_dados[DB_SIZE];" mas não define a
+      constante. Foi incluído "#define DB_SIZE 1000" (o banco tem 1000
+      entradas, chaves 0..999).
+
+
+################################################################################
+EXERCÍCIO 1
+################################################################################
+
+ENUNCIADO
+---------
+Escreva um programa log_gen.c que usa void gerar_operacoes(int n) para que ele
+escreva 10.000 operações em um arquivo log.txt.
+
+CÓDIGO FONTE (log_gen.c)
+------------------------
+/*
+ * Lab 10 - Caching
+ * Exercício 1: log_gen.c
+ *
+ * Usa a função gerar_operacoes(int n) do slide (sem mudanças) para
+ * escrever 10.000 operações no arquivo log.txt.
+ *
+ * Como gerar_operacoes() escreve com printf (na saída padrão), o main
+ * redireciona a saída padrão para o arquivo log.txt com freopen()
+ * antes de chamar a função.
+ *
+ * Compilação: gcc -Wall -o log_gen log_gen.c
+ * Execução:   ./log_gen
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+/* ========== Código do slide "Acessos Aleatórios a key = {0..999}" ========== */
+
+#define MAX_KEY 999
+#define MIN_KEY 0
+
+typedef enum {
+   READ, WRITE
+} OpType;
+
+// Função que gera e exibe N operações aleatórias
+void gerar_operacoes(int n) {
+   // Inicializa o gerador de números aleatórios com o tempo atual
+   srand(time(NULL));
+   for (int i = 0; i < n; i++) {
+       // Escolhe aleatoriamente entre READ (0) e WRITE (1)
+       OpType op = rand() % 2;
+
+       // Gera key aleatória no intervalo de 0 a 999
+       int key = (rand() % (MAX_KEY - MIN_KEY + 1)) + MIN_KEY;
+
+       if (op == READ) {
+           // Formato pedido: R, key
+           printf("R, %d\n", key);
+       } else {
+           // Gera um valor inteiro aleatório qualquer (ex: entre 10 e 5000)
+           int value = (rand() % 4991) + 10;
+
+           // Formato pedido: W, value, key
+           printf("W, %d, %d\n", value, key);
+       }
+   }
+}
+
+/* ============================ Fim do código do slide ============================ */
+
+#define NUM_OPERACOES 10000
+
+int main(void) {
+    // Redireciona a saída padrão (printf) para o arquivo log.txt
+    if (freopen("log.txt", "w", stdout) == NULL) {
+        perror("Erro ao abrir log.txt");
+        exit(1);
+    }
+
+    gerar_operacoes(NUM_OPERACOES);
+
+    fclose(stdout);
+
+    // stdout agora é o arquivo, então a confirmação vai para stderr
+    fprintf(stderr, "%d operacoes gravadas em log.txt\n", NUM_OPERACOES);
+    return 0;
+}
+
+LINHA DE COMANDO PARA COMPILAÇÃO E EXECUÇÃO
+-------------------------------------------
+gcc -Wall -o log_gen log_gen.c
+./log_gen
+
+SAÍDA GERADA
+------------
+$ ./log_gen
+10000 operacoes gravadas em log.txt
+$ head -10 log.txt
+W, 2457, 219
+W, 1828, 694
+R, 893
+W, 3832, 368
+R, 209
+R, 337
+W, 3390, 555
+W, 3989, 586
+R, 494
+R, 697
+$ wc -l log.txt
+10000 log.txt
+$ grep -c '^R' log.txt
+5003
+$ grep -c '^W' log.txt
+4997
+
+REFLEXÃO
+--------
+A função gerar_operacoes() do slide escreve cada operação com printf, ou seja,
+na saída padrão. Para gravar no arquivo log.txt sem mexer na função, o main
+usa freopen("log.txt", "w", stdout) antes de chamá-la: a partir daí, tudo o
+que vai para stdout cai no arquivo. Por isso a mensagem de confirmação é
+impressa com fprintf(stderr, ...), já que stdout passou a ser o arquivo.
+
+Cada linha do log tem o formato definido no slide: "R, key" para leitura e
+"W, value, key" para escrita, com key entre 0 e 999 e value entre 10 e 5000.
+Como a operação é sorteada com rand() % 2, o log fica dividido quase meio a
+meio entre leituras (5003) e escritas (4997). O srand(time(NULL)) faz cada
+execução do log_gen gerar um log diferente.
+
+
+################################################################################
+EXERCÍCIO 2
+################################################################################
+
+ENUNCIADO
+---------
+Escreva um outro programa multi-threaded (ou multi-processo) onde:
+  a) uma thread é o cliente que lê o log e escreve/lê o cache e/ou o banco
+     de dados
+  b) outra acessa o cache e
+  c) outra thread é o que acessa o banco de dados
+
+Implemente um banco de dados hipotético de 1000 entradas (um vetor[1000]) e
+um cache de 100 entradas, e que:
+  a) lê as entradas do arquivo log ciclicamente, em loop infinito.
+  b) implementa a estratégia Cache-aside caching (dados acessados no BD são
+     replicados no cache) e remove as entradas mais antigas
+  c) e trata o sinal Ctrl-Z, e nesse caso limpa todo o cache, mas continua
+     acessando o banco de dados.
+
+CÓDIGO FONTE (cache_aside.c)
+----------------------------
+/*
+ * Lab 10 - Caching
+ * Exercício 2: Cache-aside caching
+ *
+ * Programa multi-threaded com três threads:
+ *   a) cliente: lê o log.txt ciclicamente (loop infinito) e lê/escreve
+ *               no cache e/ou no banco de dados
+ *   b) cache:   única thread que acessa o cache
+ *   c) bd:      única thread que acessa o banco de dados
+ *
+ * Banco de dados: vetor de 1000 entradas (iniciado com valores 1..1000).
+ * Cache: no máximo 100 entradas válidas; quando está cheio, remove a
+ *        entrada mais antiga (menor timestamp).
+ *
+ * Política Cache-aside:
+ *   - Leitura: o cliente consulta o cache primeiro. Se tem (hit), retorna.
+ *              Se não tem (miss), busca no banco e salva no cache.
+ *   - Escrita: o cliente escreve só no banco de dados.
+ *
+ * Ctrl-Z (SIGTSTP): limpa todo o cache, mas o programa continua
+ * acessando o banco de dados.
+ *
+ * Compilação: gcc -Wall -o cache_aside cache_aside.c -lpthread
+ * Execução:   ./cache_aside        (precisa do log.txt na mesma pasta)
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <pthread.h>
+
+/* ==================== Código do slide "Brincando de Cache" ==================== */
+
+#include <time.h>
+typedef struct {
+      int key;      // Integer in the range 0..999
+      int value;    // Integer value
+      time_t timestamp; // time when entry was written/accessed
+} CacheEntry;
+
+/* ============= Código do slide "Acessos Aleatórios a key = {0..999}" ============= */
+
+typedef enum {
+   READ, WRITE
+} OpType;
+
+/* ===================== Código do slide "Consulta ao Cache" ===================== */
+
+#include <time.h>
+#define CACHE_SIZE 1000
+#define CACHE_HIT 1
+#define CACHE_MISS 0
+
+// O Cache é um vetor direto de CACHE_SIZE posições
+CacheEntry cache[CACHE_SIZE];
+
+// Uso de vetor auxiliar para indicar se entrada possui um dado válido (1) ou está vazio (0)
+int is_valid[CACHE_SIZE] = {0};
+
+int get(int key, int* out_value) {
+   if (key < 0 || key >= CACHE_SIZE)   return CACHE_MISS;
+
+    // Verifica se o slot correspondente à chave contém um registro válido
+    if (is_valid[key]) {
+        // CACHE HIT: Atualiza parâmetro de saída out_value com o valor guardado
+        *out_value = cache[key].value;
+
+    // Atualiza o timestamp para registrar o momento do último acesso (útil para políticas como LRU)
+    cache[key].timestamp = time(NULL);
+
+      return CACHE_HIT;
+    }
+    // CACHE MISS: A posição existe no array, mas está vazia/inválida
+    return CACHE_MISS;
+}
+
+/* ============ Código dos slides "Leitura/Escrita (lenta) do Banco de Dados" ============ */
+
+#define DB_SIZE 1000   // tamanho do banco (usado no slide, mas não definido lá)
+
+#define DB_SUCCESS 1
+#define DB_ERROR 0
+#define DELAY 10
+
+int banco_de_dados[DB_SIZE];
+
+/* Procedimento para simular a LEITURA no Banco de Dados.
+ * @return DB_SUCCESS (1) se a leitura foi bem-sucedida, DB_ERROR (0) se a chave for inválida
+ */
+
+int db_read(int key, int* out_value) {
+   // Validação de segurança dos limites do banco de dados
+   if (key < 0 || key >= 1000) {
+       printf("[DB-ERRO] Tentativa de leitura em chave inválida: %d\n", key);
+       return DB_ERROR;
+   }
+   // Copia o valor do banco de dados para o ponteiro de saída
+   *out_value = banco_de_dados[key];
+
+    printf("[DB-READ] Lendo do Banco -> Chave: %d, Valor: %d\n", key, *out_value);
+    sleep(DELAY);
+    return DB_SUCCESS;
+}
+
+ /**
+  * Procedimento para simular a ESCRITA / ATUALIZAÇÃO no Banco de Dados.
+  */
+ int db_write(int key, int new_value) {
+     // Validação de segurança dos limites do banco de dados
+     if (key < 0 || key >= 1000) {
+         printf("[DB-ERRO] Tentativa de escrita em chave inválida: %d\n", key);
+         return DB_ERROR;
+     }
+
+ // Atualiza o registro no banco de dados com o novo valor
+    banco_de_dados[key] = new_value;
+    sleep(DELAY);
+
+ printf("[DB-WRITE] Gravando no Banco -> Chave: %d, Novo Valor: %d\n", key, new_value);
+    return DB_SUCCESS;
+ }
+
+/* ============================ Fim do código dos slides ============================ */
+
+
+#define CACHE_MAX_ENTRADAS 100     // o cache guarda no máximo 100 entradas válidas
+#define INTERVALO_ESTATISTICAS 10  // imprime estatísticas a cada 10 operações
+
+int num_entradas = 0;                    // quantas entradas válidas o cache tem agora
+volatile sig_atomic_t limpar_cache = 0;  // ligado pelo tratador do Ctrl-Z
+
+
+/* ------------------------------ Funções do cache ------------------------------ */
+
+// Remove do cache a entrada válida com o timestamp mais antigo
+void remover_mais_antiga(void) {
+    int mais_antiga = -1;
+
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        if (is_valid[i] &&
+            (mais_antiga == -1 || cache[i].timestamp < cache[mais_antiga].timestamp)) {
+            mais_antiga = i;
+        }
+    }
+
+    if (mais_antiga != -1) {
+        is_valid[mais_antiga] = 0;
+        num_entradas--;
+        printf("[CACHE-REMOVE] Cache cheio, removendo a entrada mais antiga -> Chave: %d\n",
+               mais_antiga);
+    }
+}
+
+// Guarda (key, value) no cache. Se o cache estiver cheio, remove a entrada mais antiga.
+void put(int key, int value) {
+    if (key < 0 || key >= CACHE_SIZE) return;
+
+    if (!is_valid[key]) {
+        if (num_entradas == CACHE_MAX_ENTRADAS) {
+            remover_mais_antiga();
+        }
+        num_entradas++;
+    }
+
+    cache[key].key = key;
+    cache[key].value = value;
+    cache[key].timestamp = time(NULL);
+    is_valid[key] = 1;
+
+    printf("[CACHE-PUT] Guardando no Cache -> Chave: %d, Valor: %d (entradas: %d)\n",
+           key, value, num_entradas);
+}
+
+// Invalida todas as entradas do cache (usado quando chega o Ctrl-Z)
+void esvaziar_cache(void) {
+    int removidas = num_entradas;
+
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        is_valid[i] = 0;
+    }
+    num_entradas = 0;
+
+    printf("[CACHE] Ctrl-Z: cache limpo (%d entradas removidas)\n", removidas);
+}
+
+
+/* ------------------- Comunicação entre as threads (canais) -------------------
+ * Cada thread servidora (cache e bd) tem um canal. Quem quer um serviço
+ * coloca o pedido no canal e espera a resposta.
+ */
+
+// Pedidos que o cliente faz para a thread do cache
+#define CACHE_PEGAR   0   // get(): consulta o cache
+#define CACHE_GUARDAR 1   // put(): replica no cache um dado lido do banco
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    int tem_pedido;     // 1 = há um pedido sendo atendido
+    int tem_resposta;   // 1 = o servidor já respondeu
+    int op;             // operação pedida
+    int key;
+    int value;
+    int status;         // CACHE_HIT/CACHE_MISS ou DB_SUCCESS/DB_ERROR
+} Canal;
+
+Canal canal_cache;
+Canal canal_bd;
+
+void iniciar_canal(Canal* c) {
+    pthread_mutex_init(&c->mutex, NULL);
+    pthread_cond_init(&c->cond, NULL);
+    c->tem_pedido = 0;
+    c->tem_resposta = 0;
+}
+
+// Usado por quem pede o serviço: envia o pedido e espera a resposta
+void enviar_pedido(Canal* c, int op, int key, int value, int* out_value, int* status) {
+    pthread_mutex_lock(&c->mutex);
+
+    while (c->tem_pedido || c->tem_resposta)   // espera o canal ficar livre
+        pthread_cond_wait(&c->cond, &c->mutex);
+
+    c->op = op;
+    c->key = key;
+    c->value = value;
+    c->tem_pedido = 1;
+    pthread_cond_broadcast(&c->cond);
+
+    while (!c->tem_resposta)                    // espera a resposta
+        pthread_cond_wait(&c->cond, &c->mutex);
+
+    *out_value = c->value;
+    *status = c->status;
+    c->tem_resposta = 0;
+    pthread_cond_broadcast(&c->cond);
+
+    pthread_mutex_unlock(&c->mutex);
+}
+
+// Usado pela thread servidora: espera chegar um pedido
+void receber_pedido(Canal* c, int* op, int* key, int* value) {
+    pthread_mutex_lock(&c->mutex);
+
+    while (!c->tem_pedido || c->tem_resposta)
+        pthread_cond_wait(&c->cond, &c->mutex);
+
+    *op = c->op;
+    *key = c->key;
+    *value = c->value;
+
+    pthread_mutex_unlock(&c->mutex);
+}
+
+// Usado pela thread servidora: devolve a resposta para quem pediu
+void responder(Canal* c, int value, int status) {
+    pthread_mutex_lock(&c->mutex);
+
+    c->value = value;
+    c->status = status;
+    c->tem_pedido = 0;
+    c->tem_resposta = 1;
+    pthread_cond_broadcast(&c->cond);
+
+    pthread_mutex_unlock(&c->mutex);
+}
+
+
+/* ---------------------------------- Threads ---------------------------------- */
+
+// c) Thread que acessa o banco de dados
+void* thread_bd(void* arg) {
+    int op, key, value, status;
+
+    while (1) {
+        receber_pedido(&canal_bd, &op, &key, &value);
+
+        if (op == READ) {
+            status = db_read(key, &value);
+        } else {
+            status = db_write(key, value);
+        }
+
+        responder(&canal_bd, value, status);
+    }
+    return NULL;
+}
+
+// b) Thread que acessa o cache
+void* thread_cache(void* arg) {
+    int op, key, value, status;
+
+    while (1) {
+        receber_pedido(&canal_cache, &op, &key, &value);
+
+        // Se chegou um Ctrl-Z, limpa todo o cache antes de atender o pedido
+        if (limpar_cache) {
+            esvaziar_cache();
+            limpar_cache = 0;
+        }
+
+        if (op == CACHE_PEGAR) {
+            status = get(key, &value);
+            if (status == CACHE_HIT)
+                printf("[CACHE-HIT] Chave: %d, Valor: %d\n", key, value);
+            else
+                printf("[CACHE-MISS] Chave: %d\n", key);
+        } else {   // CACHE_GUARDAR
+            put(key, value);
+            status = CACHE_HIT;
+        }
+
+        responder(&canal_cache, value, status);
+    }
+    return NULL;
+}
+
+// a) Thread cliente: lê o log ciclicamente e faz os pedidos (Cache-aside)
+void* thread_cliente(void* arg) {
+    FILE* log = fopen("log.txt", "r");
+    if (log == NULL) {
+        perror("Erro ao abrir log.txt");
+        exit(1);
+    }
+
+    char linha[64];
+    int key, value, status, lixo;
+    long num_op = 0, leituras = 0, escritas = 0, hits = 0, misses = 0;
+    time_t inicio = time(NULL);
+
+    while (1) {
+        // Lê o log ciclicamente: ao chegar no fim, volta para o início
+        if (fgets(linha, sizeof(linha), log) == NULL) {
+            printf("[CLIENTE] Fim do log.txt, recomeçando do início\n");
+            rewind(log);
+            continue;
+        }
+
+        time_t t0 = time(NULL);
+
+        if (sscanf(linha, "R, %d", &key) == 1) {
+            // LEITURA: consulta o cache primeiro
+            leituras++;
+            printf("\n[CLIENTE] Operação %ld: R, %d\n", num_op + 1, key);
+
+            enviar_pedido(&canal_cache, CACHE_PEGAR, key, 0, &value, &status);
+
+            if (status == CACHE_HIT) {
+                hits++;
+            } else {
+                // MISS: busca no banco e replica o dado no cache
+                misses++;
+                enviar_pedido(&canal_bd, READ, key, 0, &value, &status);
+                if (status == DB_SUCCESS)
+                    enviar_pedido(&canal_cache, CACHE_GUARDAR, key, value, &lixo, &lixo);
+            }
+            printf("[CLIENTE] Valor lido: %d\n", value);
+
+        } else if (sscanf(linha, "W, %d, %d", &value, &key) == 2) {
+            // ESCRITA: no Cache-aside vai direto para o banco de dados
+            escritas++;
+            printf("\n[CLIENTE] Operação %ld: W, %d, %d\n", num_op + 1, value, key);
+
+            enviar_pedido(&canal_bd, WRITE, key, value, &lixo, &status);
+
+        } else {
+            continue;   // linha em formato inesperado
+        }
+
+        num_op++;
+        printf("[CLIENTE] Tempo da operação: %.0f s\n", difftime(time(NULL), t0));
+
+        if (num_op % INTERVALO_ESTATISTICAS == 0) {
+            double total = difftime(time(NULL), inicio);
+            printf("\n[ESTATÍSTICAS Cache-aside] operações: %ld | leituras: %ld (hits: %ld, misses: %ld) "
+                   "| escritas: %ld | taxa de hit: %.1f%% | tempo total: %.0f s | média: %.2f s/op\n",
+                   num_op, leituras, hits, misses, escritas,
+                   leituras > 0 ? 100.0 * hits / leituras : 0.0,
+                   total, total / num_op);
+        }
+    }
+    return NULL;
+}
+
+
+/* -------------------------------- Ctrl-Z e main -------------------------------- */
+
+// Tratador do Ctrl-Z (SIGTSTP): avisa a thread do cache que ela deve limpar tudo
+void trata_ctrl_z(int sig) {
+    limpar_cache = 1;
+    printf("\n[SINAL] Ctrl-Z recebido: o cache será limpo\n");
+}
+
+int main(void) {
+    pthread_t t_cliente, t_cache, t_bd;
+    sigset_t mascara;
+
+    // Inicialmente todos os valores do banco de dados estão escritos com valores {1..1000}
+    for (int i = 0; i < DB_SIZE; i++) {
+        banco_de_dados[i] = i + 1;
+    }
+
+    iniciar_canal(&canal_cache);
+    iniciar_canal(&canal_bd);
+
+    signal(SIGTSTP, trata_ctrl_z);
+
+    // Bloqueia o SIGTSTP antes de criar as threads (elas herdam o bloqueio).
+    // Assim o Ctrl-Z é tratado só pelo main e não interrompe o sleep(DELAY)
+    // da thread do banco de dados.
+    sigemptyset(&mascara);
+    sigaddset(&mascara, SIGTSTP);
+    pthread_sigmask(SIG_BLOCK, &mascara, NULL);
+
+    pthread_create(&t_bd, NULL, thread_bd, NULL);
+    pthread_create(&t_cache, NULL, thread_cache, NULL);
+    pthread_create(&t_cliente, NULL, thread_cliente, NULL);
+
+    // O main volta a aceitar o SIGTSTP e fica só esperando sinais
+    pthread_sigmask(SIG_UNBLOCK, &mascara, NULL);
+
+    printf("Cache-aside iniciado (PID %d). Ctrl-Z limpa o cache, Ctrl-C encerra.\n", getpid());
+
+    while (1) {
+        pause();
+    }
+    return 0;
+}
+
+LINHA DE COMANDO PARA COMPILAÇÃO E EXECUÇÃO
+-------------------------------------------
+gcc -Wall -o cache_aside cache_aside.c -lpthread
+./cache_aside
+
+(Ctrl-Z durante a execução para limpar o cache; Ctrl-C para encerrar.)
+
+SAÍDA GERADA
+------------
+Execução de cerca de 5 minutos. O Ctrl-Z foi dado durante a operação 18 e o
+programa foi encerrado com Ctrl-C depois da operação 30.
+
+Cache-aside iniciado (PID 371). Ctrl-Z limpa o cache, Ctrl-C encerra.
+
+[CLIENTE] Operação 1: W, 2457, 219
+[DB-WRITE] Gravando no Banco -> Chave: 219, Novo Valor: 2457
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 2: W, 1828, 694
+[DB-WRITE] Gravando no Banco -> Chave: 694, Novo Valor: 1828
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 3: R, 893
+[CACHE-MISS] Chave: 893
+[DB-READ] Lendo do Banco -> Chave: 893, Valor: 894
+[CACHE-PUT] Guardando no Cache -> Chave: 893, Valor: 894 (entradas: 1)
+[CLIENTE] Valor lido: 894
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 4: W, 3832, 368
+[DB-WRITE] Gravando no Banco -> Chave: 368, Novo Valor: 3832
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 5: R, 209
+[CACHE-MISS] Chave: 209
+[DB-READ] Lendo do Banco -> Chave: 209, Valor: 210
+[CACHE-PUT] Guardando no Cache -> Chave: 209, Valor: 210 (entradas: 2)
+[CLIENTE] Valor lido: 210
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 6: R, 337
+[CACHE-MISS] Chave: 337
+[DB-READ] Lendo do Banco -> Chave: 337, Valor: 338
+[CACHE-PUT] Guardando no Cache -> Chave: 337, Valor: 338 (entradas: 3)
+[CLIENTE] Valor lido: 338
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 7: W, 3390, 555
+[DB-WRITE] Gravando no Banco -> Chave: 555, Novo Valor: 3390
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 8: W, 3989, 586
+[DB-WRITE] Gravando no Banco -> Chave: 586, Novo Valor: 3989
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 9: R, 494
+[CACHE-MISS] Chave: 494
+[DB-READ] Lendo do Banco -> Chave: 494, Valor: 495
+[CACHE-PUT] Guardando no Cache -> Chave: 494, Valor: 495 (entradas: 4)
+[CLIENTE] Valor lido: 495
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 10: R, 697
+[CACHE-MISS] Chave: 697
+[DB-READ] Lendo do Banco -> Chave: 697, Valor: 698
+[CACHE-PUT] Guardando no Cache -> Chave: 697, Valor: 698 (entradas: 5)
+[CLIENTE] Valor lido: 698
+[CLIENTE] Tempo da operação: 10 s
+
+[ESTATÍSTICAS Cache-aside] operações: 10 | leituras: 5 (hits: 0, misses: 5) | escritas: 5 | taxa de hit: 0.0% | tempo total: 100 s | média: 10.00 s/op
+
+[CLIENTE] Operação 11: R, 343
+[CACHE-MISS] Chave: 343
+[DB-READ] Lendo do Banco -> Chave: 343, Valor: 344
+[CACHE-PUT] Guardando no Cache -> Chave: 343, Valor: 344 (entradas: 6)
+[CLIENTE] Valor lido: 344
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 12: W, 4422, 993
+[DB-WRITE] Gravando no Banco -> Chave: 993, Novo Valor: 4422
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 13: R, 112
+[CACHE-MISS] Chave: 112
+[DB-READ] Lendo do Banco -> Chave: 112, Valor: 113
+[CACHE-PUT] Guardando no Cache -> Chave: 112, Valor: 113 (entradas: 7)
+[CLIENTE] Valor lido: 113
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 14: W, 4926, 839
+[DB-WRITE] Gravando no Banco -> Chave: 839, Novo Valor: 4926
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 15: W, 2991, 998
+[DB-WRITE] Gravando no Banco -> Chave: 998, Novo Valor: 2991
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 16: W, 2828, 429
+[DB-WRITE] Gravando no Banco -> Chave: 429, Novo Valor: 2828
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 17: W, 3384, 917
+[DB-WRITE] Gravando no Banco -> Chave: 917, Novo Valor: 3384
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 18: R, 606
+[CACHE-MISS] Chave: 606
+[DB-READ] Lendo do Banco -> Chave: 606, Valor: 607
+
+[SINAL] Ctrl-Z recebido: o cache será limpo
+[CACHE] Ctrl-Z: cache limpo (7 entradas removidas)
+[CACHE-PUT] Guardando no Cache -> Chave: 606, Valor: 607 (entradas: 1)
+[CLIENTE] Valor lido: 607
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 19: R, 709
+[CACHE-MISS] Chave: 709
+[DB-READ] Lendo do Banco -> Chave: 709, Valor: 710
+[CACHE-PUT] Guardando no Cache -> Chave: 709, Valor: 710 (entradas: 2)
+[CLIENTE] Valor lido: 710
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 20: W, 2657, 340
+[DB-WRITE] Gravando no Banco -> Chave: 340, Novo Valor: 2657
+[CLIENTE] Tempo da operação: 10 s
+
+[ESTATÍSTICAS Cache-aside] operações: 20 | leituras: 9 (hits: 0, misses: 9) | escritas: 11 | taxa de hit: 0.0% | tempo total: 200 s | média: 10.00 s/op
+
+[CLIENTE] Operação 21: R, 620
+[CACHE-MISS] Chave: 620
+[DB-READ] Lendo do Banco -> Chave: 620, Valor: 621
+[CACHE-PUT] Guardando no Cache -> Chave: 620, Valor: 621 (entradas: 3)
+[CLIENTE] Valor lido: 621
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 22: R, 794
+[CACHE-MISS] Chave: 794
+[DB-READ] Lendo do Banco -> Chave: 794, Valor: 795
+[CACHE-PUT] Guardando no Cache -> Chave: 794, Valor: 795 (entradas: 4)
+[CLIENTE] Valor lido: 795
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 23: W, 398, 348
+[DB-WRITE] Gravando no Banco -> Chave: 348, Novo Valor: 398
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 24: W, 4810, 341
+[DB-WRITE] Gravando no Banco -> Chave: 341, Novo Valor: 4810
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 25: W, 4109, 806
+[DB-WRITE] Gravando no Banco -> Chave: 806, Novo Valor: 4109
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 26: W, 4395, 153
+[DB-WRITE] Gravando no Banco -> Chave: 153, Novo Valor: 4395
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 27: W, 1124, 561
+[DB-WRITE] Gravando no Banco -> Chave: 561, Novo Valor: 1124
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 28: R, 337
+[CACHE-MISS] Chave: 337
+[DB-READ] Lendo do Banco -> Chave: 337, Valor: 338
+[CACHE-PUT] Guardando no Cache -> Chave: 337, Valor: 338 (entradas: 5)
+[CLIENTE] Valor lido: 338
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 29: R, 103
+[CACHE-MISS] Chave: 103
+[DB-READ] Lendo do Banco -> Chave: 103, Valor: 104
+[CACHE-PUT] Guardando no Cache -> Chave: 103, Valor: 104 (entradas: 6)
+[CLIENTE] Valor lido: 104
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 30: W, 50, 166
+[DB-WRITE] Gravando no Banco -> Chave: 166, Novo Valor: 50
+[CLIENTE] Tempo da operação: 10 s
+
+[ESTATÍSTICAS Cache-aside] operações: 30 | leituras: 13 (hits: 0, misses: 13) | escritas: 17 | taxa de hit: 0.0% | tempo total: 300 s | média: 10.00 s/op
+
+REFLEXÃO
+--------
+Threads: o programa tem as três threads pedidas. A thread cliente lê o
+log.txt e decide para quem mandar cada pedido; a thread do cache é a única
+que mexe em cache[] e is_valid[] (chama get() e put()); a thread do banco é a
+única que chama db_read() e db_write(). Elas conversam por dois "canais"
+(um para o cache e outro para o banco), cada um com um mutex e uma variável
+de condição: quem pede coloca a operação no canal e fica esperando a
+resposta, e a thread servidora atende e responde. Assim o cliente sempre
+sabe o resultado (hit/miss, valor lido) antes de seguir para a próxima linha
+do log.
+
+Leitura cíclica do log: quando o fgets() chega no fim do arquivo, o cliente
+chama rewind() e volta para a primeira linha, num while(1) que não termina.
+
+Cache de 100 entradas: o código do slide define CACHE_SIZE 1000 e usa a
+própria key como posição do vetor (cache[key]), então o get() foi usado
+assim mesmo. O limite de 100 entradas é controlado pelo contador
+num_entradas: quando um dado novo vai entrar e o cache já tem 100 entradas
+válidas, a função remover_mais_antiga() procura a entrada válida com o menor
+timestamp e a invalida. Como o get() do slide atualiza o timestamp a cada
+hit, a entrada "mais antiga" é a que está há mais tempo sem ser usada, que é
+a ideia de LRU citada no comentário do próprio get().
+
+Cache-aside: segue o que está no slide. Na leitura, o cliente consulta o
+cache primeiro; se for hit, usa o valor de lá; se for miss, pede ao banco e
+depois manda o valor para o cache (put), replicando o dado acessado no BD. Na
+escrita, o cliente manda só para o banco e o cache não é avisado. Esse é o
+problema que o slide aponta para o cache-aside: se a chave escrita já estava
+no cache, o cache fica com o valor antigo (stale) até a entrada ser removida
+ou o cache ser limpo.
+
+Ctrl-Z: o Ctrl-Z manda o sinal SIGTSTP, que normalmente suspende o processo.
+Com signal(SIGTSTP, trata_ctrl_z) o programa não para: o tratador só liga a
+flag limpar_cache, e a thread do cache, antes de atender o próximo pedido,
+invalida todas as entradas. O banco continua sendo acessado normalmente. O
+SIGTSTP é bloqueado antes de criar as threads (elas herdam o bloqueio) e
+desbloqueado só no main, que fica em pause(). Assim o sinal é sempre tratado
+pelo main e não interrompe o sleep(DELAY) da thread do banco, o que deixaria
+aquela operação mais rápida do que deveria.
+
+Na saída dá para ver o efeito do Ctrl-Z: ele chegou durante a operação 18 e o
+cache perdeu as 7 entradas que tinha. A chave 337 tinha entrado no cache na
+operação 6, mas quando foi lida de novo na operação 28 deu CACHE-MISS e
+precisou ir ao banco outra vez (mais 10 s).
+
+Tempos: toda operação que passa pelo banco leva 10 s por causa do
+sleep(DELAY) do slide. Nas 30 primeiras operações não houve nenhum hit, então
+todas levaram 10 s e a média ficou em 10,00 s/op. Isso é esperado: com chaves
+espalhadas entre 0 e 999 e só 100 entradas no cache, a chance de uma leitura
+encontrar a chave no cache é baixa, principalmente no começo, quando o cache
+ainda está quase vazio.
+
+
+################################################################################
+EXERCÍCIO 3
+################################################################################
+
+ENUNCIADO
+---------
+Faça o mesmo com a política Cache write through (= a cada acesso de escrita
+no cache, o banco de dados também é atualizado).
+
+CÓDIGO FONTE (write_through.c)
+------------------------------
+/*
+ * Lab 10 - Caching
+ * Exercício 3: Cache write-through
+ *
+ * Programa multi-threaded com três threads:
+ *   a) cliente: lê o log.txt ciclicamente (loop infinito) e lê/escreve
+ *               no cache e/ou no banco de dados
+ *   b) cache:   única thread que acessa o cache
+ *   c) bd:      única thread que acessa o banco de dados
+ *
+ * Banco de dados: vetor de 1000 entradas (iniciado com valores 1..1000).
+ * Cache: no máximo 100 entradas válidas; quando está cheio, remove a
+ *        entrada mais antiga (menor timestamp).
+ *
+ * Política Cache write-through:
+ *   - Leitura: igual ao Cache-aside. O cliente consulta o cache primeiro.
+ *              Se tem (hit), retorna. Se não tem (miss), busca no banco e
+ *              salva no cache.
+ *   - Escrita: o cliente escreve no cache e, a cada escrita no cache, a
+ *              thread do cache também atualiza o banco de dados.
+ *
+ * Ctrl-Z (SIGTSTP): limpa todo o cache, mas o programa continua
+ * acessando o banco de dados.
+ *
+ * Compilação: gcc -Wall -o write_through write_through.c -lpthread
+ * Execução:   ./write_through        (precisa do log.txt na mesma pasta)
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <pthread.h>
+
+/* ==================== Código do slide "Brincando de Cache" ==================== */
+
+#include <time.h>
+typedef struct {
+      int key;      // Integer in the range 0..999
+      int value;    // Integer value
+      time_t timestamp; // time when entry was written/accessed
+} CacheEntry;
+
+/* ============= Código do slide "Acessos Aleatórios a key = {0..999}" ============= */
+
+typedef enum {
+   READ, WRITE
+} OpType;
+
+/* ===================== Código do slide "Consulta ao Cache" ===================== */
+
+#include <time.h>
+#define CACHE_SIZE 1000
+#define CACHE_HIT 1
+#define CACHE_MISS 0
+
+// O Cache é um vetor direto de CACHE_SIZE posições
+CacheEntry cache[CACHE_SIZE];
+
+// Uso de vetor auxiliar para indicar se entrada possui um dado válido (1) ou está vazio (0)
+int is_valid[CACHE_SIZE] = {0};
+
+int get(int key, int* out_value) {
+   if (key < 0 || key >= CACHE_SIZE)   return CACHE_MISS;
+
+    // Verifica se o slot correspondente à chave contém um registro válido
+    if (is_valid[key]) {
+        // CACHE HIT: Atualiza parâmetro de saída out_value com o valor guardado
+        *out_value = cache[key].value;
+
+    // Atualiza o timestamp para registrar o momento do último acesso (útil para políticas como LRU)
+    cache[key].timestamp = time(NULL);
+
+      return CACHE_HIT;
+    }
+    // CACHE MISS: A posição existe no array, mas está vazia/inválida
+    return CACHE_MISS;
+}
+
+/* ============ Código dos slides "Leitura/Escrita (lenta) do Banco de Dados" ============ */
+
+#define DB_SIZE 1000   // tamanho do banco (usado no slide, mas não definido lá)
+
+#define DB_SUCCESS 1
+#define DB_ERROR 0
+#define DELAY 10
+
+int banco_de_dados[DB_SIZE];
+
+/* Procedimento para simular a LEITURA no Banco de Dados.
+ * @return DB_SUCCESS (1) se a leitura foi bem-sucedida, DB_ERROR (0) se a chave for inválida
+ */
+
+int db_read(int key, int* out_value) {
+   // Validação de segurança dos limites do banco de dados
+   if (key < 0 || key >= 1000) {
+       printf("[DB-ERRO] Tentativa de leitura em chave inválida: %d\n", key);
+       return DB_ERROR;
+   }
+   // Copia o valor do banco de dados para o ponteiro de saída
+   *out_value = banco_de_dados[key];
+
+    printf("[DB-READ] Lendo do Banco -> Chave: %d, Valor: %d\n", key, *out_value);
+    sleep(DELAY);
+    return DB_SUCCESS;
+}
+
+ /**
+  * Procedimento para simular a ESCRITA / ATUALIZAÇÃO no Banco de Dados.
+  */
+ int db_write(int key, int new_value) {
+     // Validação de segurança dos limites do banco de dados
+     if (key < 0 || key >= 1000) {
+         printf("[DB-ERRO] Tentativa de escrita em chave inválida: %d\n", key);
+         return DB_ERROR;
+     }
+
+ // Atualiza o registro no banco de dados com o novo valor
+    banco_de_dados[key] = new_value;
+    sleep(DELAY);
+
+ printf("[DB-WRITE] Gravando no Banco -> Chave: %d, Novo Valor: %d\n", key, new_value);
+    return DB_SUCCESS;
+ }
+
+/* ============================ Fim do código dos slides ============================ */
+
+
+#define CACHE_MAX_ENTRADAS 100     // o cache guarda no máximo 100 entradas válidas
+#define INTERVALO_ESTATISTICAS 10  // imprime estatísticas a cada 10 operações
+
+int num_entradas = 0;                    // quantas entradas válidas o cache tem agora
+volatile sig_atomic_t limpar_cache = 0;  // ligado pelo tratador do Ctrl-Z
+
+
+/* ------------------------------ Funções do cache ------------------------------ */
+
+// Remove do cache a entrada válida com o timestamp mais antigo
+void remover_mais_antiga(void) {
+    int mais_antiga = -1;
+
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        if (is_valid[i] &&
+            (mais_antiga == -1 || cache[i].timestamp < cache[mais_antiga].timestamp)) {
+            mais_antiga = i;
+        }
+    }
+
+    if (mais_antiga != -1) {
+        is_valid[mais_antiga] = 0;
+        num_entradas--;
+        printf("[CACHE-REMOVE] Cache cheio, removendo a entrada mais antiga -> Chave: %d\n",
+               mais_antiga);
+    }
+}
+
+// Guarda (key, value) no cache. Se o cache estiver cheio, remove a entrada mais antiga.
+void put(int key, int value) {
+    if (key < 0 || key >= CACHE_SIZE) return;
+
+    if (!is_valid[key]) {
+        if (num_entradas == CACHE_MAX_ENTRADAS) {
+            remover_mais_antiga();
+        }
+        num_entradas++;
+    }
+
+    cache[key].key = key;
+    cache[key].value = value;
+    cache[key].timestamp = time(NULL);
+    is_valid[key] = 1;
+
+    printf("[CACHE-PUT] Guardando no Cache -> Chave: %d, Valor: %d (entradas: %d)\n",
+           key, value, num_entradas);
+}
+
+// Invalida todas as entradas do cache (usado quando chega o Ctrl-Z)
+void esvaziar_cache(void) {
+    int removidas = num_entradas;
+
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        is_valid[i] = 0;
+    }
+    num_entradas = 0;
+
+    printf("[CACHE] Ctrl-Z: cache limpo (%d entradas removidas)\n", removidas);
+}
+
+
+/* ------------------- Comunicação entre as threads (canais) -------------------
+ * Cada thread servidora (cache e bd) tem um canal. Quem quer um serviço
+ * coloca o pedido no canal e espera a resposta.
+ */
+
+// Pedidos que o cliente faz para a thread do cache
+#define CACHE_PEGAR   0   // get(): consulta o cache
+#define CACHE_GUARDAR 1   // put(): replica no cache um dado lido do banco
+#define CACHE_ESCREVER 2  // escrita do cliente: grava no cache e no banco (write-through)
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    int tem_pedido;     // 1 = há um pedido sendo atendido
+    int tem_resposta;   // 1 = o servidor já respondeu
+    int op;             // operação pedida
+    int key;
+    int value;
+    int status;         // CACHE_HIT/CACHE_MISS ou DB_SUCCESS/DB_ERROR
+} Canal;
+
+Canal canal_cache;
+Canal canal_bd;
+
+void iniciar_canal(Canal* c) {
+    pthread_mutex_init(&c->mutex, NULL);
+    pthread_cond_init(&c->cond, NULL);
+    c->tem_pedido = 0;
+    c->tem_resposta = 0;
+}
+
+// Usado por quem pede o serviço: envia o pedido e espera a resposta
+void enviar_pedido(Canal* c, int op, int key, int value, int* out_value, int* status) {
+    pthread_mutex_lock(&c->mutex);
+
+    while (c->tem_pedido || c->tem_resposta)   // espera o canal ficar livre
+        pthread_cond_wait(&c->cond, &c->mutex);
+
+    c->op = op;
+    c->key = key;
+    c->value = value;
+    c->tem_pedido = 1;
+    pthread_cond_broadcast(&c->cond);
+
+    while (!c->tem_resposta)                    // espera a resposta
+        pthread_cond_wait(&c->cond, &c->mutex);
+
+    *out_value = c->value;
+    *status = c->status;
+    c->tem_resposta = 0;
+    pthread_cond_broadcast(&c->cond);
+
+    pthread_mutex_unlock(&c->mutex);
+}
+
+// Usado pela thread servidora: espera chegar um pedido
+void receber_pedido(Canal* c, int* op, int* key, int* value) {
+    pthread_mutex_lock(&c->mutex);
+
+    while (!c->tem_pedido || c->tem_resposta)
+        pthread_cond_wait(&c->cond, &c->mutex);
+
+    *op = c->op;
+    *key = c->key;
+    *value = c->value;
+
+    pthread_mutex_unlock(&c->mutex);
+}
+
+// Usado pela thread servidora: devolve a resposta para quem pediu
+void responder(Canal* c, int value, int status) {
+    pthread_mutex_lock(&c->mutex);
+
+    c->value = value;
+    c->status = status;
+    c->tem_pedido = 0;
+    c->tem_resposta = 1;
+    pthread_cond_broadcast(&c->cond);
+
+    pthread_mutex_unlock(&c->mutex);
+}
+
+
+/* ---------------------------------- Threads ---------------------------------- */
+
+// c) Thread que acessa o banco de dados
+void* thread_bd(void* arg) {
+    int op, key, value, status;
+
+    while (1) {
+        receber_pedido(&canal_bd, &op, &key, &value);
+
+        if (op == READ) {
+            status = db_read(key, &value);
+        } else {
+            status = db_write(key, value);
+        }
+
+        responder(&canal_bd, value, status);
+    }
+    return NULL;
+}
+
+// b) Thread que acessa o cache
+void* thread_cache(void* arg) {
+    int op, key, value, status;
+
+    while (1) {
+        receber_pedido(&canal_cache, &op, &key, &value);
+
+        // Se chegou um Ctrl-Z, limpa todo o cache antes de atender o pedido
+        if (limpar_cache) {
+            esvaziar_cache();
+            limpar_cache = 0;
+        }
+
+        if (op == CACHE_PEGAR) {
+            status = get(key, &value);
+            if (status == CACHE_HIT)
+                printf("[CACHE-HIT] Chave: %d, Valor: %d\n", key, value);
+            else
+                printf("[CACHE-MISS] Chave: %d\n", key);
+        } else if (op == CACHE_GUARDAR) {
+            put(key, value);
+            status = CACHE_HIT;
+        } else {   // CACHE_ESCREVER
+            // Write-through: grava no cache e também atualiza o banco de dados
+            printf("[CACHE-WRITE] Escrita no Cache -> Chave: %d, Valor: %d (atualizando o Banco)\n",
+                   key, value);
+            put(key, value);
+            int lixo;
+            enviar_pedido(&canal_bd, WRITE, key, value, &lixo, &status);
+        }
+
+        responder(&canal_cache, value, status);
+    }
+    return NULL;
+}
+
+// a) Thread cliente: lê o log ciclicamente e faz os pedidos (Cache write-through)
+void* thread_cliente(void* arg) {
+    FILE* log = fopen("log.txt", "r");
+    if (log == NULL) {
+        perror("Erro ao abrir log.txt");
+        exit(1);
+    }
+
+    char linha[64];
+    int key, value, status, lixo;
+    long num_op = 0, leituras = 0, escritas = 0, hits = 0, misses = 0;
+    time_t inicio = time(NULL);
+
+    while (1) {
+        // Lê o log ciclicamente: ao chegar no fim, volta para o início
+        if (fgets(linha, sizeof(linha), log) == NULL) {
+            printf("[CLIENTE] Fim do log.txt, recomeçando do início\n");
+            rewind(log);
+            continue;
+        }
+
+        time_t t0 = time(NULL);
+
+        if (sscanf(linha, "R, %d", &key) == 1) {
+            // LEITURA: consulta o cache primeiro
+            leituras++;
+            printf("\n[CLIENTE] Operação %ld: R, %d\n", num_op + 1, key);
+
+            enviar_pedido(&canal_cache, CACHE_PEGAR, key, 0, &value, &status);
+
+            if (status == CACHE_HIT) {
+                hits++;
+            } else {
+                // MISS: busca no banco e replica o dado no cache
+                misses++;
+                enviar_pedido(&canal_bd, READ, key, 0, &value, &status);
+                if (status == DB_SUCCESS)
+                    enviar_pedido(&canal_cache, CACHE_GUARDAR, key, value, &lixo, &lixo);
+            }
+            printf("[CLIENTE] Valor lido: %d\n", value);
+
+        } else if (sscanf(linha, "W, %d, %d", &value, &key) == 2) {
+            // ESCRITA: no write-through vai para o cache, que também atualiza o banco
+            escritas++;
+            printf("\n[CLIENTE] Operação %ld: W, %d, %d\n", num_op + 1, value, key);
+
+            enviar_pedido(&canal_cache, CACHE_ESCREVER, key, value, &lixo, &status);
+
+        } else {
+            continue;   // linha em formato inesperado
+        }
+
+        num_op++;
+        printf("[CLIENTE] Tempo da operação: %.0f s\n", difftime(time(NULL), t0));
+
+        if (num_op % INTERVALO_ESTATISTICAS == 0) {
+            double total = difftime(time(NULL), inicio);
+            printf("\n[ESTATÍSTICAS Write-through] operações: %ld | leituras: %ld (hits: %ld, misses: %ld) "
+                   "| escritas: %ld | taxa de hit: %.1f%% | tempo total: %.0f s | média: %.2f s/op\n",
+                   num_op, leituras, hits, misses, escritas,
+                   leituras > 0 ? 100.0 * hits / leituras : 0.0,
+                   total, total / num_op);
+        }
+    }
+    return NULL;
+}
+
+
+/* -------------------------------- Ctrl-Z e main -------------------------------- */
+
+// Tratador do Ctrl-Z (SIGTSTP): avisa a thread do cache que ela deve limpar tudo
+void trata_ctrl_z(int sig) {
+    limpar_cache = 1;
+    printf("\n[SINAL] Ctrl-Z recebido: o cache será limpo\n");
+}
+
+int main(void) {
+    pthread_t t_cliente, t_cache, t_bd;
+    sigset_t mascara;
+
+    // Inicialmente todos os valores do banco de dados estão escritos com valores {1..1000}
+    for (int i = 0; i < DB_SIZE; i++) {
+        banco_de_dados[i] = i + 1;
+    }
+
+    iniciar_canal(&canal_cache);
+    iniciar_canal(&canal_bd);
+
+    signal(SIGTSTP, trata_ctrl_z);
+
+    // Bloqueia o SIGTSTP antes de criar as threads (elas herdam o bloqueio).
+    // Assim o Ctrl-Z é tratado só pelo main e não interrompe o sleep(DELAY)
+    // da thread do banco de dados.
+    sigemptyset(&mascara);
+    sigaddset(&mascara, SIGTSTP);
+    pthread_sigmask(SIG_BLOCK, &mascara, NULL);
+
+    pthread_create(&t_bd, NULL, thread_bd, NULL);
+    pthread_create(&t_cache, NULL, thread_cache, NULL);
+    pthread_create(&t_cliente, NULL, thread_cliente, NULL);
+
+    // O main volta a aceitar o SIGTSTP e fica só esperando sinais
+    pthread_sigmask(SIG_UNBLOCK, &mascara, NULL);
+
+    printf("Write-through iniciado (PID %d). Ctrl-Z limpa o cache, Ctrl-C encerra.\n", getpid());
+
+    while (1) {
+        pause();
+    }
+    return 0;
+}
+
+LINHA DE COMANDO PARA COMPILAÇÃO E EXECUÇÃO
+-------------------------------------------
+gcc -Wall -o write_through write_through.c -lpthread
+./write_through
+
+(Ctrl-Z durante a execução para limpar o cache; Ctrl-C para encerrar.)
+
+SAÍDA GERADA
+------------
+Execução de cerca de 5 minutos, com o mesmo log.txt do Exercício 2. O Ctrl-Z
+foi dado durante a operação 18 e o programa foi encerrado com Ctrl-C depois
+da operação 30.
+
+Write-through iniciado (PID 372). Ctrl-Z limpa o cache, Ctrl-C encerra.
+
+[CLIENTE] Operação 1: W, 2457, 219
+[CACHE-WRITE] Escrita no Cache -> Chave: 219, Valor: 2457 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 219, Valor: 2457 (entradas: 1)
+[DB-WRITE] Gravando no Banco -> Chave: 219, Novo Valor: 2457
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 2: W, 1828, 694
+[CACHE-WRITE] Escrita no Cache -> Chave: 694, Valor: 1828 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 694, Valor: 1828 (entradas: 2)
+[DB-WRITE] Gravando no Banco -> Chave: 694, Novo Valor: 1828
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 3: R, 893
+[CACHE-MISS] Chave: 893
+[DB-READ] Lendo do Banco -> Chave: 893, Valor: 894
+[CACHE-PUT] Guardando no Cache -> Chave: 893, Valor: 894 (entradas: 3)
+[CLIENTE] Valor lido: 894
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 4: W, 3832, 368
+[CACHE-WRITE] Escrita no Cache -> Chave: 368, Valor: 3832 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 368, Valor: 3832 (entradas: 4)
+[DB-WRITE] Gravando no Banco -> Chave: 368, Novo Valor: 3832
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 5: R, 209
+[CACHE-MISS] Chave: 209
+[DB-READ] Lendo do Banco -> Chave: 209, Valor: 210
+[CACHE-PUT] Guardando no Cache -> Chave: 209, Valor: 210 (entradas: 5)
+[CLIENTE] Valor lido: 210
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 6: R, 337
+[CACHE-MISS] Chave: 337
+[DB-READ] Lendo do Banco -> Chave: 337, Valor: 338
+[CACHE-PUT] Guardando no Cache -> Chave: 337, Valor: 338 (entradas: 6)
+[CLIENTE] Valor lido: 338
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 7: W, 3390, 555
+[CACHE-WRITE] Escrita no Cache -> Chave: 555, Valor: 3390 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 555, Valor: 3390 (entradas: 7)
+[DB-WRITE] Gravando no Banco -> Chave: 555, Novo Valor: 3390
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 8: W, 3989, 586
+[CACHE-WRITE] Escrita no Cache -> Chave: 586, Valor: 3989 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 586, Valor: 3989 (entradas: 8)
+[DB-WRITE] Gravando no Banco -> Chave: 586, Novo Valor: 3989
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 9: R, 494
+[CACHE-MISS] Chave: 494
+[DB-READ] Lendo do Banco -> Chave: 494, Valor: 495
+[CACHE-PUT] Guardando no Cache -> Chave: 494, Valor: 495 (entradas: 9)
+[CLIENTE] Valor lido: 495
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 10: R, 697
+[CACHE-MISS] Chave: 697
+[DB-READ] Lendo do Banco -> Chave: 697, Valor: 698
+[CACHE-PUT] Guardando no Cache -> Chave: 697, Valor: 698 (entradas: 10)
+[CLIENTE] Valor lido: 698
+[CLIENTE] Tempo da operação: 10 s
+
+[ESTATÍSTICAS Write-through] operações: 10 | leituras: 5 (hits: 0, misses: 5) | escritas: 5 | taxa de hit: 0.0% | tempo total: 100 s | média: 10.00 s/op
+
+[CLIENTE] Operação 11: R, 343
+[CACHE-MISS] Chave: 343
+[DB-READ] Lendo do Banco -> Chave: 343, Valor: 344
+[CACHE-PUT] Guardando no Cache -> Chave: 343, Valor: 344 (entradas: 11)
+[CLIENTE] Valor lido: 344
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 12: W, 4422, 993
+[CACHE-WRITE] Escrita no Cache -> Chave: 993, Valor: 4422 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 993, Valor: 4422 (entradas: 12)
+[DB-WRITE] Gravando no Banco -> Chave: 993, Novo Valor: 4422
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 13: R, 112
+[CACHE-MISS] Chave: 112
+[DB-READ] Lendo do Banco -> Chave: 112, Valor: 113
+[CACHE-PUT] Guardando no Cache -> Chave: 112, Valor: 113 (entradas: 13)
+[CLIENTE] Valor lido: 113
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 14: W, 4926, 839
+[CACHE-WRITE] Escrita no Cache -> Chave: 839, Valor: 4926 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 839, Valor: 4926 (entradas: 14)
+[DB-WRITE] Gravando no Banco -> Chave: 839, Novo Valor: 4926
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 15: W, 2991, 998
+[CACHE-WRITE] Escrita no Cache -> Chave: 998, Valor: 2991 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 998, Valor: 2991 (entradas: 15)
+[DB-WRITE] Gravando no Banco -> Chave: 998, Novo Valor: 2991
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 16: W, 2828, 429
+[CACHE-WRITE] Escrita no Cache -> Chave: 429, Valor: 2828 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 429, Valor: 2828 (entradas: 16)
+[DB-WRITE] Gravando no Banco -> Chave: 429, Novo Valor: 2828
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 17: W, 3384, 917
+[CACHE-WRITE] Escrita no Cache -> Chave: 917, Valor: 3384 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 917, Valor: 3384 (entradas: 17)
+[DB-WRITE] Gravando no Banco -> Chave: 917, Novo Valor: 3384
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 18: R, 606
+[CACHE-MISS] Chave: 606
+[DB-READ] Lendo do Banco -> Chave: 606, Valor: 607
+
+[SINAL] Ctrl-Z recebido: o cache será limpo
+[CACHE] Ctrl-Z: cache limpo (17 entradas removidas)
+[CACHE-PUT] Guardando no Cache -> Chave: 606, Valor: 607 (entradas: 1)
+[CLIENTE] Valor lido: 607
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 19: R, 709
+[CACHE-MISS] Chave: 709
+[DB-READ] Lendo do Banco -> Chave: 709, Valor: 710
+[CACHE-PUT] Guardando no Cache -> Chave: 709, Valor: 710 (entradas: 2)
+[CLIENTE] Valor lido: 710
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 20: W, 2657, 340
+[CACHE-WRITE] Escrita no Cache -> Chave: 340, Valor: 2657 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 340, Valor: 2657 (entradas: 3)
+[DB-WRITE] Gravando no Banco -> Chave: 340, Novo Valor: 2657
+[CLIENTE] Tempo da operação: 10 s
+
+[ESTATÍSTICAS Write-through] operações: 20 | leituras: 9 (hits: 0, misses: 9) | escritas: 11 | taxa de hit: 0.0% | tempo total: 200 s | média: 10.00 s/op
+
+[CLIENTE] Operação 21: R, 620
+[CACHE-MISS] Chave: 620
+[DB-READ] Lendo do Banco -> Chave: 620, Valor: 621
+[CACHE-PUT] Guardando no Cache -> Chave: 620, Valor: 621 (entradas: 4)
+[CLIENTE] Valor lido: 621
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 22: R, 794
+[CACHE-MISS] Chave: 794
+[DB-READ] Lendo do Banco -> Chave: 794, Valor: 795
+[CACHE-PUT] Guardando no Cache -> Chave: 794, Valor: 795 (entradas: 5)
+[CLIENTE] Valor lido: 795
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 23: W, 398, 348
+[CACHE-WRITE] Escrita no Cache -> Chave: 348, Valor: 398 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 348, Valor: 398 (entradas: 6)
+[DB-WRITE] Gravando no Banco -> Chave: 348, Novo Valor: 398
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 24: W, 4810, 341
+[CACHE-WRITE] Escrita no Cache -> Chave: 341, Valor: 4810 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 341, Valor: 4810 (entradas: 7)
+[DB-WRITE] Gravando no Banco -> Chave: 341, Novo Valor: 4810
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 25: W, 4109, 806
+[CACHE-WRITE] Escrita no Cache -> Chave: 806, Valor: 4109 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 806, Valor: 4109 (entradas: 8)
+[DB-WRITE] Gravando no Banco -> Chave: 806, Novo Valor: 4109
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 26: W, 4395, 153
+[CACHE-WRITE] Escrita no Cache -> Chave: 153, Valor: 4395 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 153, Valor: 4395 (entradas: 9)
+[DB-WRITE] Gravando no Banco -> Chave: 153, Novo Valor: 4395
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 27: W, 1124, 561
+[CACHE-WRITE] Escrita no Cache -> Chave: 561, Valor: 1124 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 561, Valor: 1124 (entradas: 10)
+[DB-WRITE] Gravando no Banco -> Chave: 561, Novo Valor: 1124
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 28: R, 337
+[CACHE-MISS] Chave: 337
+[DB-READ] Lendo do Banco -> Chave: 337, Valor: 338
+[CACHE-PUT] Guardando no Cache -> Chave: 337, Valor: 338 (entradas: 11)
+[CLIENTE] Valor lido: 338
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 29: R, 103
+[CACHE-MISS] Chave: 103
+[DB-READ] Lendo do Banco -> Chave: 103, Valor: 104
+[CACHE-PUT] Guardando no Cache -> Chave: 103, Valor: 104 (entradas: 12)
+[CLIENTE] Valor lido: 104
+[CLIENTE] Tempo da operação: 10 s
+
+[CLIENTE] Operação 30: W, 50, 166
+[CACHE-WRITE] Escrita no Cache -> Chave: 166, Valor: 50 (atualizando o Banco)
+[CACHE-PUT] Guardando no Cache -> Chave: 166, Valor: 50 (entradas: 13)
+[DB-WRITE] Gravando no Banco -> Chave: 166, Novo Valor: 50
+[CLIENTE] Tempo da operação: 10 s
+
+[ESTATÍSTICAS Write-through] operações: 30 | leituras: 13 (hits: 0, misses: 13) | escritas: 17 | taxa de hit: 0.0% | tempo total: 300 s | média: 10.00 s/op
+
+REFLEXÃO
+--------
+O programa é o mesmo do Exercício 2 (mesmas threads, mesmo cache de 100
+entradas, mesma remoção da entrada mais antiga, mesma leitura cíclica e mesmo
+tratamento do Ctrl-Z). A única diferença está na escrita:
+
+  - Cache-aside: o cliente escreve direto no banco.
+  - Write-through: o cliente manda a escrita para a thread do cache
+    (pedido CACHE_ESCREVER). A thread do cache grava o valor no cache com
+    put() e, em seguida, pede à thread do banco o db_write(). É a seta
+    cache <-> Banco de Dados do diagrama do slide.
+
+A leitura continua igual: consulta o cache e, se der miss, busca no banco e
+replica no cache.
+
+Como toda escrita passa pelo cache e pelo banco, os dois ficam sempre iguais e
+uma leitura nunca devolve um valor desatualizado, o que resolve o problema de
+dado stale do cache-aside. Outro efeito é que as escritas também ocupam o
+cache: no momento do Ctrl-Z (operação 18) o cache tinha 17 entradas, contra 7
+no cache-aside, porque cada W do log também virou uma entrada.
+
+Pelo slide, no write-through "toda escrita é mais lenta (duas operações)". Na
+saída, porém, a escrita levou os mesmos 10 s do cache-aside: a gravação no
+cache é só uma atribuição num vetor na memória, que não aparece perto do
+sleep(10) do db_write(). As 30 primeiras operações tiveram de novo 0 hits e
+média de 10,00 s/op.
+
+
+################################################################################
+EXERCÍCIO 4
+################################################################################
+
+ENUNCIADO
+---------
+Discuta as diferenças em termos de tempo de processamento.
+
+DISCUSSÃO
+---------
+Custo de cada acesso nos programas:
+  - acesso ao cache (get/put): praticamente 0 s (é um vetor na memória)
+  - acesso ao banco (db_read/db_write): 10 s (sleep(DELAY) com DELAY 10)
+
+Tempo de cada tipo de operação:
+
+  Operação               Cache-aside               Write-through
+  ---------------------  ------------------------  ---------------------------
+  Leitura com hit        0 s (só cache)            0 s (só cache)
+  Leitura com miss       10 s (db_read + put)      10 s (db_read + put)
+  Escrita                10 s (db_write)           10 s (put + db_write)
+
+Ou seja, o tempo total depende quase só de quantas vezes o banco é acessado.
+As escritas custam o mesmo nas duas políticas, porque as duas sempre gravam no
+banco. O que pode mudar o tempo é a quantidade de leituras que dão hit.
+
+Nas execuções (30 operações cada) os dois programas tiveram exatamente o mesmo
+tempo: 300 s, média de 10,00 s/op, sem nenhum hit. Para uma execução mais
+longa dá para estimar o comportamento a partir do próprio log. As chaves são
+sorteadas de maneira uniforme entre 0 e 999 e o cache guarda só 100 delas,
+então, depois que o cache enche, uma leitura acha a chave no cache em cerca de
+100/1000 = 10% das vezes. Com metade das operações sendo leitura:
+
+  tempo médio por operação ~ 0,5 x (0,9 x 10 s) + 0,5 x 10 s = 9,5 s
+
+  Sem cache:      10000 operações x 10 s   = 100.000 s (~27,8 h por ciclo do log)
+  Com cache:      10000 operações x 9,5 s  ~  95.000 s (~26,4 h por ciclo do log)
+
+Ou seja, um ganho de só uns 5%, e praticamente igual nas duas políticas.
+O slide resume bem o motivo: "A diferença entre o espalhamento dos endereços
+(keys) de acesso e o tamanho do cache determinam tudo." Aqui as chaves estão
+espalhadas por 1000 posições, sem nenhuma chave mais acessada que as outras, e
+o cache cobre só 10% delas, então ele quase não ajuda. Se o log repetisse mais
+as mesmas chaves, ou se o cache fosse maior, a taxa de hit subiria e o tempo
+cairia nas duas políticas.
+
+Diferenças entre as duas políticas:
+
+  - Write-through tende a ter um pouco mais de hits, porque as escritas
+    também colocam a chave no cache: uma leitura logo depois de uma escrita
+    na mesma chave dá hit. Com chaves uniformes isso quase não muda a taxa de
+    hit (continua perto de 10%), já que o cache só tem 100 posições e as
+    escritas também empurram outras entradas para fora.
+
+  - O custo extra da escrita no write-through (gravar no cache e no banco)
+    não aparece aqui porque o cache é memória local. Num sistema real, com o
+    cache em outro serviço (como um servidor de cache em rede), a segunda
+    operação teria custo e a escrita ficaria mais lenta que no cache-aside,
+    como diz o slide. Por isso o write-through vale mais a pena quando há
+    muito mais leituras que escritas, o que não é o caso deste log (metade
+    escrita).
+
+  - O cache-aside escreve mais barato, mas paga com consistência: uma leitura
+    com hit pode devolver um valor que já foi alterado no banco. O
+    write-through gasta o mesmo tempo aqui e nunca devolve valor
+    desatualizado.
+
+  - O Ctrl-Z afeta as duas do mesmo jeito: depois de limpar o cache, a taxa
+    de hit cai a zero e todas as leituras voltam a custar 10 s até o cache se
+    encher de novo, o que leva pelo menos 100 acessos ao banco (mais de
+    1000 s).
+
+Conclusão: com o banco levando 10 s por acesso e chaves uniformes, o tempo de
+processamento é dominado pelo banco e as duas políticas ficam praticamente
+iguais (cerca de 9,5 s por operação, contra 10 s sem cache). A diferença
+prática entre elas está mais na consistência dos dados (write-through nunca
+fica desatualizado) do que no tempo.
